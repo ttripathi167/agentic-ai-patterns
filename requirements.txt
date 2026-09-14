@@ -1,0 +1,2 @@
+# Pure standard library — no dependencies for the demo.
+# Production wiring would add: an LLM SDK, an MCP client, your chat-ops/ITSM SDK.
