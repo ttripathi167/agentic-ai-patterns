@@ -2,29 +2,80 @@
 
 Every model-shaped piece is a deterministic local function, clearly labeled.
 Production swap points are marked: replace plan() with an LLM planner,
-route() with a router model, critic_score() with an independent
+route() with a router model, Critic.score() with an independent
 judge-model call, and wire gates.gate(demo_mode=False) to a real
 approval surface.
+
+The loop runs over the synthetic task suite in agent/tasks.py. Each
+TaskRun records everything a production trace would carry: iterations
+used, the critic score at every iteration, per-tool-call timing, the gate
+decision, and whether the run succeeded or escalated.
 """
-import hashlib
+import random
+import time
+from dataclasses import dataclass, field
 
 from agent.gates import Action, RiskTier, gate
+from agent.tasks import TASKS, get_task
 from agent.tools import TOOL_REGISTRY
 
 MAX_ITERS = 3
-CRITIC_THRESHOLD = 0.8
+CRITIC_THRESHOLD = 0.80
+CRITIC_SEED = "agentic-ai-patterns-v1"  # fixed seed => reproducible benchmarks
 
 
-def plan(task: str) -> list[dict]:
-    """Mock planner: decomposes a task into tool steps (simulated)."""
+# ---------------------------------------------------------------------------
+# Structured run records
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolCall:
+    tool: str
+    agent: str
+    tier: str
+    duration_ms: float
+    result_preview: str = ""
+
+
+@dataclass
+class TaskRun:
+    task_id: str
+    title: str
+    prompt: str
+    iterations: int                       # critic rounds actually executed
+    critic_scores: list[float]            # one score per iteration
+    tool_calls: list[ToolCall]
+    succeeded: bool                       # critic passed within MAX_ITERS
+    escalated: bool                       # hit max iterations -> human reviewer
+    gate_decision: object = None          # GateDecision, if a final action ran
+    gate_tier: str = ""                   # risk tier of the gated action
+    action_executed: bool = False
+    transcript: list[str] = field(default_factory=list)
+
+    @property
+    def tool_call_count(self) -> int:
+        return len(self.tool_calls)
+
+
+# ---------------------------------------------------------------------------
+# Planner / router / critic (all simulated, deterministic)
+# ---------------------------------------------------------------------------
+
+def plan(task: dict) -> list[dict]:
+    """Mock planner: returns the task's decomposed tool steps (simulated).
+
+    Accepts a task spec dict from agent/tasks.py. A bare string keeps the
+    old behavior: keyword match against known tasks, else a generic
+    single-step lookup plan.
+    """
+    if isinstance(task, dict):
+        return task["steps"]
     task_l = task.lower()
-    if "ticket" in task_l or "triage" in task_l:
-        return [
-            {"agent": "research", "tool": "get_ticket", "args": {"ticket_id": "INC-1042"}},
-            {"agent": "research", "tool": "search_kb", "args": {"query": task}},
-            {"agent": "extraction", "tool": "draft_summary", "args": {}},
-            {"agent": "action", "tool": "update_ticket", "args": {"note": "triage summary attached"}},
-        ]
+    for spec in TASKS:
+        if spec["id"] in task_l or any(
+            kw in task_l for kw in spec["prompt"].split()[:3]
+        ):
+            return spec["steps"]
     return [{"agent": "research", "tool": "search_kb", "args": {"query": task}}]
 
 
@@ -33,20 +84,46 @@ def route(step: dict) -> str:
     return step["agent"]
 
 
-def critic_score(draft: dict, iteration: int) -> float:
-    """Simulated critic score. Deterministic so the demo is reproducible.
+class Critic:
+    """Simulated independent critic. Deterministic by (seed, task, iteration).
 
-    Production: an independent judge model (different config than the
-    planner) scoring groundedness, completeness, and policy compliance.
+    Score model: base + delta * (iteration - 1), plus a small seeded jitter
+    in [-0.02, +0.02]. Seeding on the task id and iteration (not on global
+    RNG state) keeps benchmarks reproducible run after run.
+
+    Production: an independent judge model — different config/family than
+    the planner — scoring groundedness, completeness, and policy compliance
+    (see docs/adr/002-independent-critic.md).
     """
-    digest = hashlib.sha256(repr(sorted(draft.items())).encode()).hexdigest()
-    base = (int(digest[:4], 16) % 25) / 100.0  # 0.00–0.24
-    return round(min(0.70 + base + 0.08 * iteration, 0.99), 2)
+
+    def __init__(self, threshold: float = CRITIC_THRESHOLD,
+                 seed: str = CRITIC_SEED):
+        self.threshold = threshold
+        self.seed = seed
+
+    def score(self, task: dict, iteration: int) -> float:
+        rng = random.Random(f"{self.seed}:{task['id']}:{iteration}")
+        jitter = rng.uniform(-0.02, 0.02)
+        raw = task["critic_base"] + task["critic_delta"] * (iteration - 1) + jitter
+        return round(min(0.99, max(0.0, raw)), 2)
+
+    def verdict(self, task: dict, iteration: int) -> tuple[float, bool]:
+        s = self.score(task, iteration)
+        return s, s >= self.threshold
 
 
-def run(task: str, demo_mode: bool = True) -> list[str]:
-    """Execute the agent loop. Returns a human-readable transcript."""
+# ---------------------------------------------------------------------------
+# The loop
+# ---------------------------------------------------------------------------
+
+def run_task(task: dict, demo_mode: bool = True,
+             critic: Critic | None = None) -> TaskRun:
+    """Execute the full loop for one task. Returns a structured TaskRun."""
+    critic = critic or Critic()
     transcript: list[str] = []
+    tool_calls: list[ToolCall] = []
+    scores: list[float] = []
+
     steps = plan(task)
     transcript.append(f"plan: {len(steps)} steps")
 
@@ -55,59 +132,104 @@ def run(task: str, demo_mode: bool = True) -> list[str]:
         agent = route(step)
         tool_name = step["tool"]
         entry = TOOL_REGISTRY[tool_name]
-        transcript.append(f"step {i}: [{agent}] -> {tool_name} (tier={entry['tier']})")
+        transcript.append(
+            f"step {i}: [{agent}] -> {tool_name} (tier={entry['tier']})")
 
+        t0 = time.perf_counter()
         if tool_name == "draft_summary":
             result = entry["fn"](context.get("ticket", {}), context.get("kb_hits", []))
-        elif tool_name == "update_ticket":
-            result = {"tool": tool_name, "pending": True}  # gated below
-        elif tool_name == "get_ticket":
-            result = entry["fn"](**step["args"])
-            context["ticket"] = result
         else:
             result = entry["fn"](**step["args"])
-            if tool_name == "search_kb":
+            if tool_name == "get_ticket":
+                context["ticket"] = result
+            elif tool_name == "search_kb":
                 context["kb_hits"] = result["hits"]
-        transcript.append(f"  result: {str(result)[:120]}")
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
-    # critic review over the draft artifacts
-    draft = {"task": task, "steps": len(steps), "context_keys": sorted(context)}
+        tool_calls.append(ToolCall(
+            tool=tool_name, agent=agent, tier=entry["tier"],
+            duration_ms=dt_ms, result_preview=str(result)[:100]))
+        transcript.append(f"  result ({dt_ms:.2f} ms): {str(result)[:120]}")
+
+    # critic review: iterate until the score clears the threshold
     approved = False
+    iterations = 0
     for it in range(1, MAX_ITERS + 1):
-        score = critic_score(draft, it)
+        iterations = it
+        score, passed = critic.verdict(task, it)
+        scores.append(score)
         transcript.append(f"critic (iter {it}): score={score:.2f}")
-        if score >= CRITIC_THRESHOLD:
+        if passed:
             approved = True
-            transcript.append(f"critic: PASS (>= {CRITIC_THRESHOLD})")
+            transcript.append(f"critic: PASS (>= {critic.threshold})")
             break
         transcript.append("critic: below threshold -> re-plan (simulated refinement)")
 
     if not approved:
         transcript.append("STOP: max iterations -> escalate to human reviewer")
-        return transcript
+        return TaskRun(
+            task_id=task["id"], title=task["title"], prompt=task["prompt"],
+            iterations=iterations, critic_scores=scores, tool_calls=tool_calls,
+            succeeded=False, escalated=True, transcript=transcript)
 
-    # consequential action goes through the HITL gate
-    action = Action(
-        name="update_ticket",
-        tier=RiskTier.WRITE,
-        description="Attach triage summary note to INC-1042",
-        evidence=f"plan={len(steps)} steps, critic score above threshold",
-    )
-    decision = gate(action, demo_mode=demo_mode)
-    transcript.append(
-        f"HITL gate: action={action.name} tier={action.tier.value} "
-        f"evidence=({action.evidence})"
-    )
-    transcript.append(
-        f"gate: approved={decision.approved} by={decision.decided_by} "
-        f"({decision.reason})"
-    )
-    if decision.approved:
-        result = TOOL_REGISTRY["update_ticket"]["fn"]("INC-1042", "triage summary attached")
-        transcript.append(f"executed: {result['tool']} (mock)")
-    return transcript
+    # consequential actions go through the HITL gate; reads/drafts need none
+    gate_decision = None
+    gate_tier = ""
+    action_executed = False
+    final = task.get("final_action")
+    if final:
+        action = Action(
+            name=final["name"],
+            tier=RiskTier(final["tier"]),
+            description=final["description"],
+            evidence=(f"plan={len(steps)} steps, "
+                      f"critic scores={[f'{s:.2f}' for s in scores]}"),
+        )
+        gate_decision = gate(action, demo_mode=demo_mode)
+        gate_tier = action.tier.value
+        transcript.append(
+            f"HITL gate: action={action.name} tier={action.tier.value} "
+            f"evidence=({action.evidence})")
+        transcript.append(
+            f"gate: approved={gate_decision.approved} "
+            f"by={gate_decision.decided_by} ({gate_decision.reason})")
+        if gate_decision.approved:
+            result = TOOL_REGISTRY[final["name"]]["fn"](**final["args"])
+            action_executed = True
+            transcript.append(f"executed: {result['tool']} (mock)")
+    else:
+        transcript.append("no consequential action: read/draft-only, no gate needed")
+
+    return TaskRun(
+        task_id=task["id"], title=task["title"], prompt=task["prompt"],
+        iterations=iterations, critic_scores=scores, tool_calls=tool_calls,
+        succeeded=True, escalated=False, gate_decision=gate_decision,
+        gate_tier=gate_tier, action_executed=action_executed,
+        transcript=transcript)
+
+
+def run_all(demo_mode: bool = True) -> list[TaskRun]:
+    """Run the full synthetic benchmark suite. Returns one TaskRun per task."""
+    critic = Critic()  # shared config across the suite, like one judge model
+    return [run_task(task, demo_mode=demo_mode, critic=critic) for task in TASKS]
+
+
+def run(task: str, demo_mode: bool = True) -> list[str]:
+    """Legacy entry point: execute a single task, return a text transcript.
+
+    Kept for backward compatibility; new code should use run_task/run_all.
+    """
+    try:
+        spec = get_task(task)
+    except KeyError:
+        spec = {
+            "id": "ad-hoc", "title": task, "prompt": task,
+            "steps": plan(task), "final_action": None,
+            "critic_base": 0.85, "critic_delta": 0.0,
+        }
+    return run_task(spec, demo_mode=demo_mode).transcript
 
 
 if __name__ == "__main__":
-    for line in run("triage ticket INC-1042"):
+    for line in run("triage-p1"):
         print(line)

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile check (all Python files)
+        run: python -m compileall -q agent run_demo.py scripts
+
+      - name: Run demo end-to-end (fast, no pauses)
+        run: python run_demo.py --fast
+
+      - name: Run benchmark suite (regenerates tables)
+        run: python scripts/benchmark.py --out /tmp/BENCHMARKS.check.md && test -s /tmp/BENCHMARKS.check.md
